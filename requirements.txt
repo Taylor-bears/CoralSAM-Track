@@ -1,0 +1,24 @@
+# Core deep learning
+torch>=2.1.0
+torchvision>=0.16.0
+
+# SAM2 (install from source for video predictor)
+# Run: pip install -e git+https://github.com/facebookresearch/sam2.git#egg=sam2
+# Or clone locally: git clone https://github.com/facebookresearch/sam2 && cd sam2 && pip install -e .
+
+# Image processing
+opencv-python>=4.8.0
+Pillow>=10.0.0
+scipy>=1.11.0
+
+# Utilities
+numpy>=1.24.0
+tqdm>=4.65.0
+PyYAML>=6.0
+matplotlib>=3.7.0
+
+# Optional: CoralSCOP (SAM-based coral detector)
+# Requires segment-anything base:
+# pip install git+https://github.com/facebookresearch/segment-anything.git
+# Then clone CoralSCOP: git clone https://github.com/zhengziqiang/CoralSCOP
+# Weight: vit_b_coralscop.pth (see README for download link)
