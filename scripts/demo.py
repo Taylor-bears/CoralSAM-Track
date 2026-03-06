@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # Allow running from project root
@@ -37,6 +38,21 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("demo")
+
+
+def _setup_file_logging(log_path: Path) -> None:
+    """Add a file handler so all log output is also written to disk."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = logging.FileHandler(log_path, mode="w")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(
+        logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%H:%M:%S",
+        )
+    )
+    logging.getLogger().addHandler(fh)
+    log.info("Logging to file: %s", log_path)
 
 
 def parse_args() -> argparse.Namespace:
@@ -77,6 +93,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Torch device ('cuda' or 'cpu'). Auto-detected if not set.",
     )
+    parser.add_argument(
+        "--run_id",
+        type=str,
+        default=None,
+        help=(
+            "Unique run identifier appended to log filenames and output directories "
+            "(e.g. '20260305_120000'). Auto-generated from current timestamp if omitted."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -100,10 +125,23 @@ def main() -> None:
         print("Error: specify --seq <name> or --all")
         sys.exit(1)
 
+    # Determine run identifier (used for timestamped logs + output dirs)
+    run_id: str = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Short tag used for log filenames; "with_drift_corr" is the folder name used by the tracker
+    log_tag = "baseline" if args.no_drift_correction else "drift_corr"
+    log_path = Path("logs") / f"{log_tag}_{run_id}.log"
+    _setup_file_logging(log_path)
+    log.info("Run ID: %s", run_id)
+
     # Load config
     cfg = load_config(args.config)
     if args.output:
         cfg.setdefault("output", {})["base_dir"] = args.output
+    else:
+        # Default: place outputs under outputs/<run_id>/
+        cfg.setdefault("output", {})["base_dir"] = str(Path("outputs") / run_id)
+
+    log.info("Output base dir: %s", cfg["output"]["base_dir"])
 
     data_root = cfg.get("data_root", "partial_coralvos/partial")
 
@@ -143,10 +181,10 @@ def main() -> None:
             avg_fps = mean(v["fps"] for v in valid if "fps" in v)
             print(f"\nAggregate FPS (mean over {len(valid)} sequences): {avg_fps:.1f}")
 
-    # Save timing JSON
+    # Save timing JSON  (folder name matches what CoralTracker uses)
     out_base = cfg.get("output", {}).get("base_dir", "outputs")
-    drift_tag = "baseline" if args.no_drift_correction else "with_drift_corr"
-    timing_path = Path(out_base) / drift_tag / "timing.json"
+    folder_tag = "baseline" if args.no_drift_correction else "with_drift_corr"
+    timing_path = Path(out_base) / folder_tag / "timing.json"
     timing_path.parent.mkdir(parents=True, exist_ok=True)
     with open(timing_path, "w") as f:
         json.dump(all_timing, f, indent=2)

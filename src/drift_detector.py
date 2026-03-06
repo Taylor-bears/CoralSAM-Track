@@ -39,29 +39,37 @@ log = logging.getLogger(__name__)
 class DriftDetector:
     """Detects tracking drift and decides whether to trigger re-initialisation.
 
+    Three complementary signals are monitored:
+      1. EMA-smoothed confidence drop (SAM2 sigmoid logits proxy)
+      2. Sudden mask area jump/collapse between consecutive check frames
+      3. Low mask-to-mask IoU between consecutive check frames
+
     Parameters
     ----------
     cfg : dict
         Loaded from configs/default.yaml.  Relevant sub-keys under ``drift``:
-          - conf_thresh          (float, default 0.70)
-          - area_ratio_thresh    (float, default 3.0)
-          - ema_alpha            (float, default 0.3)  – EMA smoothing factor
+          - conf_thresh          (float, default 0.50)
+          - area_ratio_thresh    (float, default 1.8)
+          - iou_thresh           (float, default 0.30) – IoU below this → drift
+          - ema_alpha            (float, default 0.4)  – EMA smoothing factor
           - consecutive_low_conf (int,   default 2)    – consecutive low-conf
                                                           frames needed to fire
     """
 
     def __init__(self, cfg: dict) -> None:
         drift_cfg = cfg.get("drift", {})
-        self.conf_thresh: float = float(drift_cfg.get("conf_thresh", 0.70))
-        self.area_ratio_thresh: float = float(drift_cfg.get("area_ratio_thresh", 3.0))
+        self.conf_thresh: float = float(drift_cfg.get("conf_thresh", 0.50))
+        self.area_ratio_thresh: float = float(drift_cfg.get("area_ratio_thresh", 1.8))
+        self.iou_thresh: float = float(drift_cfg.get("iou_thresh", 0.30))
         # EMA smoothing coefficient for confidence history
-        self._ema_alpha: float = float(drift_cfg.get("ema_alpha", 0.3))
+        self._ema_alpha: float = float(drift_cfg.get("ema_alpha", 0.4))
         # Number of consecutive below-threshold frames required to fire
         self._consec_required: int = int(drift_cfg.get("consecutive_low_conf", 2))
 
         # Internal state
         self._ema_conf: Optional[float] = None
         self._low_conf_streak: int = 0
+        self._prev_mask: Optional[np.ndarray] = None  # mask at last check frame
         self._history: Deque[dict] = deque(maxlen=50)
 
     # ------------------------------------------------------------------
@@ -88,7 +96,8 @@ class DriftDetector:
             True  → drift detected, caller should trigger re-init.
             False → tracking looks healthy.
         """
-        current_area = int(mask.astype(bool).sum())
+        current_mask = mask.astype(bool)
+        current_area = int(current_mask.sum())
 
         # ---- 1. Update EMA confidence ----
         if self._ema_conf is None:
@@ -118,7 +127,18 @@ class DriftDetector:
             area_drift = True
             area_ratio = float("inf")
 
-        # ---- 4. Record history ----
+        # ---- 4. IoU consistency check ----
+        iou_drift = False
+        iou_score = 1.0
+        if self._prev_mask is not None and self.iou_thresh > 0:
+            inter = (current_mask & self._prev_mask).sum()
+            union = (current_mask | self._prev_mask).sum()
+            iou_score = float(inter) / float(union) if union > 0 else 1.0
+            iou_drift = iou_score < self.iou_thresh
+
+        self._prev_mask = current_mask.copy()
+
+        # ---- 5. Record history ----
         self._history.append(
             {
                 "frame_idx": frame_idx,
@@ -126,13 +146,15 @@ class DriftDetector:
                 "ema_conf": self._ema_conf,
                 "area": current_area,
                 "area_ratio": area_ratio,
+                "iou": iou_score,
                 "conf_drift": conf_drift,
                 "area_drift": area_drift,
+                "iou_drift": iou_drift,
             }
         )
 
-        # ---- 5. Decision ----
-        is_drift = conf_drift or area_drift
+        # ---- 6. Decision ----
+        is_drift = conf_drift or area_drift or iou_drift
 
         if is_drift:
             reasons = []
@@ -145,6 +167,10 @@ class DriftDetector:
                 reasons.append(
                     f"area_ratio={area_ratio:.2f} > {self.area_ratio_thresh}"
                 )
+            if iou_drift:
+                reasons.append(
+                    f"iou={iou_score:.3f} < {self.iou_thresh}"
+                )
             log.debug(
                 "[DriftDetector] frame=%d DRIFT: %s", frame_idx, "; ".join(reasons)
             )
@@ -152,10 +178,11 @@ class DriftDetector:
             self._low_conf_streak = 0
         else:
             log.debug(
-                "[DriftDetector] frame=%d OK  ema_conf=%.3f  area_ratio=%.2f",
+                "[DriftDetector] frame=%d OK  ema_conf=%.3f  area_ratio=%.2f  iou=%.3f",
                 frame_idx,
                 self._ema_conf,
                 area_ratio,
+                iou_score,
             )
 
         return is_drift
@@ -164,6 +191,7 @@ class DriftDetector:
         """Reset internal state (call after each re-initialisation)."""
         self._ema_conf = None
         self._low_conf_streak = 0
+        self._prev_mask = None
 
     # ------------------------------------------------------------------
     # Diagnostics

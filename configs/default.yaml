@@ -23,12 +23,15 @@ sam2:
   checkpoint: checkpoints/sam2.1_hiera_large.pt
   # Config path relative to sam2 package install location.
   # After installing sam2, this resolves to sam2/configs/sam2.1/sam2.1_hiera_l.yaml
-  config: sam2.1_hiera_l.yaml
+  config: configs/sam2.1/sam2.1_hiera_l.yaml
   model_size: large   # tiny | small | base_plus | large
-  # Grid prompting for SAM2-Auto init
+  # Grid prompting for SAM2-Auto init (only used when GT first frame unavailable)
   grid_size: 16       # NxN grid of candidate points on first frame
   min_mask_area: 500  # pixels – discard tiny spurious masks
   score_thresh: 0.70  # SAM2 iou_predictions threshold for keeping a mask
+  # Area budget: merged auto-init mask is capped at this fraction of frame pixels.
+  # Prevents the union of many accepted masks from covering half the image.
+  max_area_frac: 0.30
 
 # ---------------------------------------------------------------------------
 # CoralSCOP settings (only used when init_method: coralscop)
@@ -46,18 +49,53 @@ coralscop:
 # ---------------------------------------------------------------------------
 drift:
   enabled: true
-  # SAM2 reports iou_predictions per object per frame (0-1 float).
-  # Drop below this → suspect drift.
+  # SAM2 sigmoid(logits).max() is used as a proxy confidence.
+  # Note: this value is almost always near 1.0 for SAM2 — the signal is
+  # in *relative* drops rather than absolute value.  A lower threshold
+  # (e.g. 0.70) is more sensitive to real confidence degradation.
   conf_thresh: 0.70
-  # Mask area ratio between consecutive frames.
+  # Mask area ratio between consecutive check frames.
   # max(s_t/s_{t-1}, s_{t-1}/s_t) > this → suspect drift.
-  area_ratio_thresh: 3.0
+  # Lowered from 1.8 to 1.5 to catch more moderate area jumps.
+  area_ratio_thresh: 1.5
   # Only run drift check every N frames (saves compute, catches slow drift).
-  check_interval: 10
+  # Lowered from 5 to 2 to detect fast drift much earlier.
+  check_interval: 2
+  # IoU threshold between consecutive masks below which drift is suspected.
+  # Lowered from 0.30 to 0.10 for higher sensitivity to shape/position changes.
+  iou_thresh: 0.10
+  # EMA smoothing coefficient for confidence history (0.3 = slow, 0.6 = fast)
+  ema_alpha: 0.4
+  # Consecutive below-threshold frames required to fire (reduced to 1 for faster response)
+  consecutive_low_conf: 1
   # When re-initialising, use the mask from (t-1) as the new prompt
   # rather than re-running the auto detector (faster but less accurate
   # after a real drift). Set to false to always re-run auto-init.
-  use_prev_mask_for_reinit: false
+  use_prev_mask_for_reinit: true
+  # ---- Accept/Reject gate for re-initialisation ----
+  # When reinit_mask comes from auto_init (i.e. use_prev_mask_for_reinit=false),
+  # we run one SAM2 forward step and only accept M_reinit over M_base when:
+  #   conf(M_reinit) > conf(M_base) + reinit_gate_delta_conf   (conf gate)  OR
+  #   IoU(M_reinit, M_prev_frame) > IoU(M_base, M_prev_frame) + reinit_gate_delta_iou  (IoU gate)
+  # This prevents a bad auto-init from pulling a healthy sequence off-track.
+  # The gate is automatically skipped when source="prev_mask" (same mask, always safe).
+  reinit_gate_enabled: true
+  reinit_gate_delta_conf: 0.05   # minimum confidence margin to prefer M_reinit
+  reinit_gate_delta_iou: 0.05    # minimum IoU margin  to prefer M_reinit
+  # Proactive GT-guided re-initialisation: DISABLED (set to 0).
+  # Using GT masks during inference constitutes data leakage.
+  # GT is only used for first-frame initialisation (standard VOS protocol).
+  proactive_reinit_interval: 0
+
+# ---------------------------------------------------------------------------
+# Post-processing
+# ---------------------------------------------------------------------------
+postprocess:
+  # Apply morphological operations to predicted masks before saving.
+  # binary_fill_holes removes interior gaps → improves J (region IoU).
+  # binary_closing smooths ragged edges → improves F (contour score).
+  morphology: true
+  close_size: 5    # Structuring element size for binary_closing (pixels)
 
 # ---------------------------------------------------------------------------
 # Output

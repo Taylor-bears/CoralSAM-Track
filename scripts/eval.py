@@ -136,6 +136,10 @@ def evaluate_sequence(
 ) -> Dict[str, float]:
     """Compute per-frame J and F for one sequence, return mean values.
 
+    Iterates over GT annotated frames (standard VOS evaluation convention).
+    Frames with GT but no prediction are scored as 0. Frames with prediction
+    but no GT (unannotated frames common in CoralVOS) are silently ignored.
+
     Args:
         pred_dir:  Directory containing <frame_name>.png predicted masks.
         gt_dir:    Directory containing <frame_name>.png GT masks.
@@ -144,24 +148,26 @@ def evaluate_sequence(
     Returns:
         dict with keys: J_mean, F_mean, JF_mean, n_frames
     """
-    pred_files = sorted(pred_dir.glob("*.png"))
-    if not pred_files:
-        pred_files = sorted(pred_dir.glob("*.jpg"))
-    if not pred_files:
-        log.warning("No predictions found in %s", pred_dir)
+    gt_files = sorted(gt_dir.glob("*.png"))
+    if not gt_files:
+        gt_files = sorted(gt_dir.glob("*.jpg"))
+    if not gt_files:
+        log.warning("No GT masks found in %s", gt_dir)
         return {"J_mean": 0.0, "F_mean": 0.0, "JF_mean": 0.0, "n_frames": 0}
 
     j_scores: List[float] = []
     f_scores: List[float] = []
-    missing_gt = 0
+    missing_pred = 0
 
-    for pred_path in tqdm(pred_files, desc=seq_name, leave=False):
-        frame_name = pred_path.stem
-        gt_path = gt_dir / f"{frame_name}.png"
-        if not gt_path.exists():
-            gt_path = gt_dir / f"{frame_name}.jpg"
-        if not gt_path.exists():
-            missing_gt += 1
+    for gt_path in tqdm(gt_files, desc=seq_name, leave=False):
+        frame_name = gt_path.stem
+        pred_path = pred_dir / f"{frame_name}.png"
+        if not pred_path.exists():
+            pred_path = pred_dir / f"{frame_name}.jpg"
+        if not pred_path.exists():
+            missing_pred += 1
+            j_scores.append(0.0)
+            f_scores.append(0.0)
             continue
 
         pred_mask = read_mask(str(pred_path))
@@ -179,8 +185,11 @@ def evaluate_sequence(
         j_scores.append(compute_iou(pred_mask, gt_mask))
         f_scores.append(compute_f_measure(pred_mask, gt_mask))
 
-    if missing_gt:
-        log.warning("Sequence '%s': %d frames had no GT mask.", seq_name, missing_gt)
+    if missing_pred:
+        log.warning(
+            "Sequence '%s': %d GT frames had no prediction (scored as 0).",
+            seq_name, missing_pred,
+        )
 
     n = len(j_scores)
     if n == 0:

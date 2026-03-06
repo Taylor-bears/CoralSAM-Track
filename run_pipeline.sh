@@ -5,16 +5,30 @@
 # ============================================================
 
 # ────────────────────────────────────────────────────────────
-# ★ 基本路径配置（按照服务器实际路径修改）
+# ★ 基本路径配置
 # ────────────────────────────────────────────────────────────
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # 脚本所在目录即项目根目录
-PYTHON="/data1/baiyang/anaconda/envs/coralsam/bin/python"      # ← 按服务器 conda 路径修改
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON="/data1/baiyang/anaconda/envs/coralsam/bin/python"
 CONFIG="configs/default.yaml"
 
+# 确保 conda 环境的 libstdc++ 优先于系统版本（修复 GLIBCXX 版本冲突）
+CONDA_LIB="/data1/baiyang/anaconda/envs/coralsam/lib"
+export LD_LIBRARY_PATH="${CONDA_LIB}:${LD_LIBRARY_PATH}"
+
 # ────────────────────────────────────────────────────────────
-# ★ CUDA 设备（填写服务器显卡编号，多卡只取 id=0 的那张）
+# ★ 并行模式
+#   "off"      → 串行执行（安全，适合只有一张空卡时）
+#   "same_gpu" → 两任务同一张卡并行（显存充足时，如 3090 空余 >18GB）
+#   "dual_gpu" → 两任务分别用两张不同的卡（推荐，速度最快）
 # ────────────────────────────────────────────────────────────
-CUDA_DEVICE=0   # ← 修改为你要用的 GPU id（nvidia-smi 查看）
+PARALLEL_MODE="off"   # off | same_gpu | dual_gpu
+
+# 串行 / same_gpu 模式时使用的单卡
+CUDA_DEVICE=3
+
+# dual_gpu 模式时分别指定两张卡
+CUDA_DEVICE_BASELINE=3     # baseline（无漂移纠偏）用这张卡（空余 24GB）
+CUDA_DEVICE_DRIFT=0        # drift_corr（漂移纠偏）用这张卡（空余 24GB）
 
 # ────────────────────────────────────────────────────────────
 # ★ 序列选择
@@ -22,20 +36,25 @@ CUDA_DEVICE=0   # ← 修改为你要用的 GPU id（nvidia-smi 查看）
 #   ALL_SEQS="false" → 只跑 SEQUENCES 里指定的序列
 # ────────────────────────────────────────────────────────────
 ALL_SEQS="true"
-SEQUENCES="video8 video75 video79 video97 video98 video102"    # ALL_SEQS=false 时生效
+SEQUENCES="video8 video75 video79 video97 video98 video102"
 
 # ────────────────────────────────────────────────────────────
 # ★ 运行模式开关
 # ────────────────────────────────────────────────────────────
-RUN_BASELINE="true"        # 是否跑无漂移纠偏基线
-RUN_DRIFT_CORR="true"      # 是否跑带漂移纠偏版本
-RUN_EVAL="true"            # 是否在两者完成后跑评测对比
-SAVE_VIS="true"            # 是否保存可视化结果（关掉可节省磁盘空间）
+RUN_BASELINE="true"
+RUN_DRIFT_CORR="true"
+RUN_EVAL="true"
+SAVE_VIS="true"
+
+# ────────────────────────────────────────────────────────────
+# ★ 时间戳 Run ID
+# ────────────────────────────────────────────────────────────
+RUN_ID=$(date +"%Y%m%d_%H%M%S")
 
 # ────────────────────────────────────────────────────────────
 # ★ 输出目录
 # ────────────────────────────────────────────────────────────
-OUTPUT_DIR="outputs"
+OUTPUT_DIR="outputs/${RUN_ID}"
 EVAL_JSON="${OUTPUT_DIR}/eval_results.json"
 LOG_DIR="logs"
 mkdir -p "${LOG_DIR}" "${OUTPUT_DIR}"
@@ -50,9 +69,6 @@ RED='\033[0;31m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-# ────────────────────────────────────────────────────────────
-# 工具函数
-# ────────────────────────────────────────────────────────────
 log_info()  { echo -e "${CYAN}[INFO]  $*${NC}"; }
 log_ok()    { echo -e "${GREEN}[OK]    $*${NC}"; }
 log_warn()  { echo -e "${YELLOW}[WARN]  $*${NC}"; }
@@ -66,22 +82,28 @@ format_duration() {
 }
 
 # ────────────────────────────────────────────────────────────
-# 显示配置摘要
+# 配置摘要
 # ────────────────────────────────────────────────────────────
 log_head "══════════════ CoralSAM-Track 配置摘要 ══════════════"
-log_info "项目根目录 : ${PROJECT_ROOT}"
-log_info "Python     : ${PYTHON}"
-log_info "Config     : ${CONFIG}"
-log_info "CUDA 设备  : GPU ${CUDA_DEVICE}"
-log_info "序列模式   : $([ "$ALL_SEQS" = "true" ] && echo "全部序列" || echo "${SEQUENCES}")"
-log_info "基线推理   : ${RUN_BASELINE}"
-log_info "漂移纠偏   : ${RUN_DRIFT_CORR}"
-log_info "评测对比   : ${RUN_EVAL}"
-log_info "保存可视化 : ${SAVE_VIS}"
-log_info "输出目录   : ${OUTPUT_DIR}"
+log_info "项目根目录  : ${PROJECT_ROOT}"
+log_info "Python      : ${PYTHON}"
+log_info "Config      : ${CONFIG}"
+log_info "并行模式    : ${PARALLEL_MODE}"
+if [ "${PARALLEL_MODE}" = "dual_gpu" ]; then
+    log_info "GPU baseline: ${CUDA_DEVICE_BASELINE}"
+    log_info "GPU drift   : ${CUDA_DEVICE_DRIFT}"
+else
+    log_info "CUDA 设备   : GPU ${CUDA_DEVICE}"
+fi
+log_info "序列模式    : $([ "$ALL_SEQS" = "true" ] && echo "全部序列" || echo "${SEQUENCES}")"
+log_info "基线推理    : ${RUN_BASELINE}"
+log_info "漂移纠偏    : ${RUN_DRIFT_CORR}"
+log_info "评测对比    : ${RUN_EVAL}"
+log_info "保存可视化  : ${SAVE_VIS}"
+log_info "Run ID      : ${RUN_ID}"
+log_info "输出目录    : ${OUTPUT_DIR}"
 log_sep
 
-# 切换到项目根目录
 cd "${PROJECT_ROOT}" || { log_err "无法进入项目目录: ${PROJECT_ROOT}"; exit 1; }
 
 # ────────────────────────────────────────────────────────────
@@ -89,178 +111,244 @@ cd "${PROJECT_ROOT}" || { log_err "无法进入项目目录: ${PROJECT_ROOT}"; e
 # ────────────────────────────────────────────────────────────
 log_head "Step 0 / 环境检查"
 
-# 检查 Python
 if [ ! -f "${PYTHON}" ]; then
-    log_warn "指定 Python 不存在: ${PYTHON}"
-    log_warn "尝试使用系统 python3..."
+    log_warn "指定 Python 不存在: ${PYTHON}，尝试系统 python3..."
     PYTHON=$(which python3)
-    if [ -z "${PYTHON}" ]; then
-        log_err "找不到 python3，请修改 PYTHON 路径后重试"
-        exit 1
-    fi
+    [ -z "${PYTHON}" ] && { log_err "找不到 python3"; exit 1; }
 fi
-PYTHON_VER=$(${PYTHON} --version 2>&1)
-log_ok "Python: ${PYTHON_VER}"
+log_ok "Python: $(${PYTHON} --version 2>&1)"
 
-# 检查 PyTorch + CUDA
 ${PYTHON} - <<'PYCHECK'
-import sys
-try:
-    import torch
-    cuda_ok = torch.cuda.is_available()
-    device_name = torch.cuda.get_device_name(0) if cuda_ok else "N/A"
-    print(f"  PyTorch  : {torch.__version__}")
-    print(f"  CUDA可用 : {cuda_ok}")
-    print(f"  GPU      : {device_name}")
-    if not cuda_ok:
-        print("  WARNING  : CUDA不可用，将使用CPU（速度会很慢）")
-except ImportError:
-    print("  ERROR: PyTorch 未安装，请先运行 pip install torch torchvision")
-    sys.exit(1)
+import sys, torch
+cuda_ok = torch.cuda.is_available()
+print(f"  PyTorch  : {torch.__version__}")
+print(f"  CUDA可用 : {cuda_ok}")
+if cuda_ok:
+    import os
+    dev = int(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0])
+    print(f"  GPU[0]   : {torch.cuda.get_device_name(0)}")
+else:
+    print("  WARNING  : CUDA不可用，将使用CPU（速度很慢）")
 PYCHECK
-PYCHECK_EXIT=$?
-[ $PYCHECK_EXIT -ne 0 ] && { log_err "PyTorch 检查失败，请先安装依赖"; exit 1; }
+[ $? -ne 0 ] && { log_err "PyTorch 检查失败"; exit 1; }
 
-# 检查 SAM2
 ${PYTHON} -c "import sam2; print(f'  SAM2     : {sam2.__version__}')" 2>/dev/null \
-    || log_warn "SAM2 未安装或版本较老（仍可继续，运行时会报错）"
+    || log_warn "SAM2 未安装或版本较老（仍可继续）"
 
-# 检查数据集
 DATA_ROOT=$(${PYTHON} -c "
 import yaml
-with open('${CONFIG}') as f:
-    cfg = yaml.safe_load(f)
+with open('${CONFIG}') as f: cfg = yaml.safe_load(f)
 print(cfg.get('data_root', 'partial_coralvos/partial'))
 " 2>/dev/null)
 DATA_ROOT="${DATA_ROOT:-partial_coralvos/partial}"
 
-if [ ! -d "${DATA_ROOT}/images" ]; then
-    log_err "数据集目录不存在: ${DATA_ROOT}/images"
-    log_err "请确认 configs/default.yaml 中 data_root 指向正确路径"
-    exit 1
-fi
+[ ! -d "${DATA_ROOT}/images" ] && {
+    log_err "数据集目录不存在: ${DATA_ROOT}/images"; exit 1; }
 
 SEQ_COUNT=$(ls -1 "${DATA_ROOT}/images" | wc -l)
 log_ok "数据集: ${DATA_ROOT}  (${SEQ_COUNT} 个序列: $(ls ${DATA_ROOT}/images | tr '\n' ' '))"
 
-# 检查 SAM2 权重
 SAM2_CKPT=$(${PYTHON} -c "
 import yaml
-with open('${CONFIG}') as f:
-    cfg = yaml.safe_load(f)
+with open('${CONFIG}') as f: cfg = yaml.safe_load(f)
 print(cfg.get('sam2', {}).get('checkpoint', 'checkpoints/sam2.1_hiera_large.pt'))
 " 2>/dev/null)
 SAM2_CKPT="${SAM2_CKPT:-checkpoints/sam2.1_hiera_large.pt}"
 
 if [ ! -f "${SAM2_CKPT}" ]; then
-    log_warn "SAM2 权重不存在: ${SAM2_CKPT}"
-    log_warn "尝试自动下载 sam2.1_hiera_large.pt ..."
+    log_warn "SAM2 权重不存在，尝试自动下载..."
     mkdir -p checkpoints
     wget -q --show-progress \
         "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt" \
         -O "${SAM2_CKPT}" \
         && log_ok "SAM2 权重下载成功" \
-        || { log_err "下载失败，请手动下载后放到 checkpoints/ 目录"; exit 1; }
+        || { log_err "下载失败，请手动下载"; exit 1; }
 fi
 log_ok "SAM2 权重: ${SAM2_CKPT}"
 log_sep
 
 # ────────────────────────────────────────────────────────────
-# 构建公共参数
+# 日志文件路径
 # ────────────────────────────────────────────────────────────
-SEQ_ARGS=""
-if [ "$ALL_SEQS" = "false" ]; then
-    SEQ_ARGS=""
-    for SEQ in $SEQUENCES; do
-        SEQ_ARGS="$SEQ_ARGS --seq $SEQ"
-    done
-    # demo.py 只接受单个 --seq，需要用 --all 或逐序列循环
-    # 此处改为构建列表，在下方循环处理
-    :
-fi
+BASELINE_LOG="${LOG_DIR}/baseline_${RUN_ID}.log"
+DRIFT_LOG="${LOG_DIR}/drift_corr_${RUN_ID}.log"
+EVAL_LOG="${LOG_DIR}/eval_${RUN_ID}.log"
 
 # ────────────────────────────────────────────────────────────
-# 内部函数：运行 demo.py（单次执行）
+# 内部函数：串行模式 — 运行 demo.py 并实时打印到终端
 # ────────────────────────────────────────────────────────────
-run_demo() {
-    local mode_label=$1   # "基线" 或 "漂移纠偏"
-    local drift_flag=$2   # "" 或 "--no_drift_correction"
-    local log_file=$3
-
+run_demo_serial() {
+    local mode_label=$1
+    local gpu_device=$2
+    local drift_flag=$3
+    local log_file=$4
     local t_start=$(date +%s)
-    log_head "推理 [$mode_label]  $(date '+%H:%M:%S')"
+
+    log_head "推理 [${mode_label}]  GPU=${gpu_device}  $(date '+%H:%M:%S')"
 
     if [ "$ALL_SEQS" = "true" ]; then
-        # 一次性跑全部序列
-        CUDA_VISIBLE_DEVICES=${CUDA_DEVICE} \
+        CUDA_VISIBLE_DEVICES=${gpu_device} \
         ${PYTHON} scripts/demo.py \
-            --all \
-            --config "${CONFIG}" \
-            ${drift_flag} \
-            --output "${OUTPUT_DIR}" \
+            --all --config "${CONFIG}" ${drift_flag} \
+            --output "${OUTPUT_DIR}" --run_id "${RUN_ID}" \
             2>&1 | tee "${log_file}"
-        local exit_code=${PIPESTATUS[0]}
+        local ec=${PIPESTATUS[0]}
     else
-        # 逐序列循环（支持指定序列列表）
-        local exit_code=0
+        local ec=0
         for SEQ in $SEQUENCES; do
             log_info "  处理序列: ${SEQ}"
-            CUDA_VISIBLE_DEVICES=${CUDA_DEVICE} \
+            CUDA_VISIBLE_DEVICES=${gpu_device} \
             ${PYTHON} scripts/demo.py \
-                --seq "${SEQ}" \
-                --config "${CONFIG}" \
-                ${drift_flag} \
-                --output "${OUTPUT_DIR}" \
+                --seq "${SEQ}" --config "${CONFIG}" ${drift_flag} \
+                --output "${OUTPUT_DIR}" --run_id "${RUN_ID}" \
                 2>&1 | tee -a "${log_file}"
-            local ec=${PIPESTATUS[0]}
-            [ $ec -ne 0 ] && exit_code=$ec
+            local seq_ec=${PIPESTATUS[0]}
+            [ $seq_ec -ne 0 ] && ec=$seq_ec
         done
     fi
 
-    local t_end=$(date +%s)
-    local dur=$((t_end - t_start))
-
-    if [ $exit_code -eq 0 ]; then
-        log_ok "[$mode_label] 推理完成  耗时: $(format_duration $dur)"
+    local dur=$(( $(date +%s) - t_start ))
+    if [ $ec -eq 0 ]; then
+        log_ok "[${mode_label}] 完成  耗时: $(format_duration $dur)"
     else
-        log_err "[$mode_label] 推理失败 (exit=$exit_code)  耗时: $(format_duration $dur)"
+        log_err "[${mode_label}] 失败 (exit=$ec)  耗时: $(format_duration $dur)"
     fi
-    return $exit_code
+    return $ec
 }
 
 # ────────────────────────────────────────────────────────────
-# Step 1：基线推理（无漂移纠偏）
+# 内部函数：并行模式 — 后台运行，只写日志文件
+# ────────────────────────────────────────────────────────────
+run_demo_bg() {
+    local mode_label=$1
+    local gpu_device=$2
+    local drift_flag=$3
+    local log_file=$4
+    local t_start=$(date +%s)
+
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [START] ${mode_label}  GPU=${gpu_device}" > "${log_file}"
+
+    if [ "$ALL_SEQS" = "true" ]; then
+        CUDA_VISIBLE_DEVICES=${gpu_device} \
+        ${PYTHON} scripts/demo.py \
+            --all --config "${CONFIG}" ${drift_flag} \
+            --output "${OUTPUT_DIR}" --run_id "${RUN_ID}" \
+            >> "${log_file}" 2>&1
+        local ec=$?
+    else
+        local ec=0
+        for SEQ in $SEQUENCES; do
+            CUDA_VISIBLE_DEVICES=${gpu_device} \
+            ${PYTHON} scripts/demo.py \
+                --seq "${SEQ}" --config "${CONFIG}" ${drift_flag} \
+                --output "${OUTPUT_DIR}" --run_id "${RUN_ID}" \
+                >> "${log_file}" 2>&1
+            local seq_ec=$?
+            [ $seq_ec -ne 0 ] && ec=$seq_ec
+        done
+    fi
+
+    local dur=$(( $(date +%s) - t_start ))
+    if [ $ec -eq 0 ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [DONE]  ${mode_label}  耗时: $(format_duration $dur)" >> "${log_file}"
+    else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [FAIL]  ${mode_label}  exit=$ec  耗时: $(format_duration $dur)" >> "${log_file}"
+    fi
+    return $ec
+}
+
+# ────────────────────────────────────────────────────────────
+# Steps 1+2：推理（串行 or 并行）
 # ────────────────────────────────────────────────────────────
 FAILED_STEPS=""
 TOTAL_START=$(date +%s)
 
-if [ "$RUN_BASELINE" = "true" ]; then
-    run_demo "基线（无漂移纠偏）" "--no_drift_correction" "${LOG_DIR}/baseline.log"
-    if [ $? -eq 0 ]; then
-        log_ok "基线 masks 已保存 → ${OUTPUT_DIR}/baseline/masks/"
-    else
-        FAILED_STEPS="$FAILED_STEPS baseline"
-        log_err "基线推理失败，查看日志: ${LOG_DIR}/baseline.log"
+if [ "${PARALLEL_MODE}" = "off" ]; then
+    # ── 串行：按顺序逐个执行 ──────────────────────────────
+    if [ "$RUN_BASELINE" = "true" ]; then
+        run_demo_serial "基线（无漂移纠偏）" "${CUDA_DEVICE}" "--no_drift_correction" "${BASELINE_LOG}"
+        [ $? -eq 0 ] && log_ok "基线 masks → ${OUTPUT_DIR}/baseline/masks/" \
+                      || FAILED_STEPS="$FAILED_STEPS baseline"
+        log_sep
     fi
+
+    if [ "$RUN_DRIFT_CORR" = "true" ]; then
+        run_demo_serial "漂移纠偏" "${CUDA_DEVICE}" "" "${DRIFT_LOG}"
+        [ $? -eq 0 ] && log_ok "漂移纠偏 masks → ${OUTPUT_DIR}/with_drift_corr/masks/" \
+                      || FAILED_STEPS="$FAILED_STEPS drift_corr"
+        log_sep
+    fi
+
+else
+    # ── 并行：两任务同时启动，等待双方结束 ───────────────
+    if [ "${PARALLEL_MODE}" = "dual_gpu" ]; then
+        GPU_BASELINE=${CUDA_DEVICE_BASELINE}
+        GPU_DRIFT=${CUDA_DEVICE_DRIFT}
+    else
+        # same_gpu：共享同一张卡
+        GPU_BASELINE=${CUDA_DEVICE}
+        GPU_DRIFT=${CUDA_DEVICE}
+    fi
+
+    PARA_START=$(date +%s)
+    log_head "Steps 1+2 / 并行推理  模式=${PARALLEL_MODE}  $(date '+%H:%M:%S')"
+
+    PID_BASELINE=""
+    PID_DRIFT=""
+
+    if [ "$RUN_BASELINE" = "true" ]; then
+        run_demo_bg "baseline" "${GPU_BASELINE}" "--no_drift_correction" "${BASELINE_LOG}" &
+        PID_BASELINE=$!
+        log_ok "baseline   已后台启动  GPU=${GPU_BASELINE}  PID=${PID_BASELINE}"
+        log_info "  实时日志: tail -f ${BASELINE_LOG}"
+    fi
+
+    if [ "$RUN_DRIFT_CORR" = "true" ]; then
+        run_demo_bg "drift_corr" "${GPU_DRIFT}" "" "${DRIFT_LOG}" &
+        PID_DRIFT=$!
+        log_ok "drift_corr 已后台启动  GPU=${GPU_DRIFT}  PID=${PID_DRIFT}"
+        log_info "  实时日志: tail -f ${DRIFT_LOG}"
+    fi
+
+    log_sep
+    log_info "两任务并行运行中，等待完成..."
+    log_info "可在另一终端运行以下命令实时查看进度："
+    log_info "  tail -f ${BASELINE_LOG}"
+    log_info "  tail -f ${DRIFT_LOG}"
+    log_sep
+
+    EC_BASELINE=0
+    EC_DRIFT=0
+
+    if [ -n "${PID_BASELINE}" ]; then
+        wait ${PID_BASELINE}
+        EC_BASELINE=$?
+        if [ $EC_BASELINE -eq 0 ]; then
+            log_ok "baseline   完成  (PID=${PID_BASELINE})"
+        else
+            log_err "baseline   失败 (exit=${EC_BASELINE})"
+            FAILED_STEPS="$FAILED_STEPS baseline"
+        fi
+    fi
+
+    if [ -n "${PID_DRIFT}" ]; then
+        wait ${PID_DRIFT}
+        EC_DRIFT=$?
+        if [ $EC_DRIFT -eq 0 ]; then
+            log_ok "drift_corr 完成  (PID=${PID_DRIFT})"
+        else
+            log_err "drift_corr 失败 (exit=${EC_DRIFT})"
+            FAILED_STEPS="$FAILED_STEPS drift_corr"
+        fi
+    fi
+
+    PARA_DUR=$(( $(date +%s) - PARA_START ))
+    log_ok "并行推理结束  实际耗时: $(format_duration $PARA_DUR)"
     log_sep
 fi
 
 # ────────────────────────────────────────────────────────────
-# Step 2：带漂移纠偏推理
-# ────────────────────────────────────────────────────────────
-if [ "$RUN_DRIFT_CORR" = "true" ]; then
-    run_demo "漂移纠偏" "" "${LOG_DIR}/drift_corr.log"
-    if [ $? -eq 0 ]; then
-        log_ok "漂移纠偏 masks 已保存 → ${OUTPUT_DIR}/with_drift_corr/masks/"
-    else
-        FAILED_STEPS="$FAILED_STEPS drift_corr"
-        log_err "漂移纠偏推理失败，查看日志: ${LOG_DIR}/drift_corr.log"
-    fi
-    log_sep
-fi
-
-# ────────────────────────────────────────────────────────────
-# Step 3：评测对比（需要两者均已完成）
+# Step 3：评测对比
 # ────────────────────────────────────────────────────────────
 if [ "$RUN_EVAL" = "true" ]; then
     log_head "Step 3 / 评测对比  $(date '+%H:%M:%S')"
@@ -269,7 +357,6 @@ if [ "$RUN_EVAL" = "true" ]; then
     PRED_DIR="${OUTPUT_DIR}/with_drift_corr/masks"
     BASE_DIR="${OUTPUT_DIR}/baseline/masks"
 
-    # 检查预测目录是否存在
     EVAL_ARGS="--pred_dir ${PRED_DIR} --config ${CONFIG} --output_json ${EVAL_JSON}"
     if [ -d "${BASE_DIR}" ]; then
         EVAL_ARGS="$EVAL_ARGS --baseline_dir ${BASE_DIR}"
@@ -281,12 +368,9 @@ if [ "$RUN_EVAL" = "true" ]; then
     if [ ! -d "${PRED_DIR}" ]; then
         log_warn "预测目录不存在: ${PRED_DIR}，跳过评测"
     else
-        ${PYTHON} scripts/eval.py ${EVAL_ARGS} \
-            2>&1 | tee "${LOG_DIR}/eval.log"
+        ${PYTHON} scripts/eval.py ${EVAL_ARGS} 2>&1 | tee "${EVAL_LOG}"
         eval_exit=${PIPESTATUS[0]}
-
-        t_eval_end=$(date +%s)
-        eval_dur=$((t_eval_end - t_eval_start))
+        eval_dur=$(( $(date +%s) - t_eval_start ))
 
         if [ $eval_exit -eq 0 ]; then
             log_ok "评测完成  耗时: $(format_duration $eval_dur)"
@@ -302,21 +386,24 @@ fi
 # ────────────────────────────────────────────────────────────
 # 总结
 # ────────────────────────────────────────────────────────────
-TOTAL_END=$(date +%s)
-TOTAL_DUR=$((TOTAL_END - TOTAL_START))
+TOTAL_DUR=$(( $(date +%s) - TOTAL_START ))
 
 log_head "══════════════════ 运行总结 ══════════════════"
-log_info "总耗时    : $(format_duration $TOTAL_DUR)"
-log_info "输出目录  : ${OUTPUT_DIR}/"
-log_info "  基线 masks : ${OUTPUT_DIR}/baseline/masks/"
-log_info "  纠偏 masks : ${OUTPUT_DIR}/with_drift_corr/masks/"
-log_info "  可视化    : ${OUTPUT_DIR}/*/vis/"
-log_info "  评测 JSON  : ${EVAL_JSON}"
-log_info "日志目录  : ${LOG_DIR}/"
+log_info "Run ID      : ${RUN_ID}"
+log_info "并行模式    : ${PARALLEL_MODE}"
+log_info "总耗时      : $(format_duration $TOTAL_DUR)"
+log_info "输出目录    : ${OUTPUT_DIR}/"
+log_info "  基线 masks  : ${OUTPUT_DIR}/baseline/masks/"
+log_info "  纠偏 masks  : ${OUTPUT_DIR}/with_drift_corr/masks/"
+log_info "  可视化      : ${OUTPUT_DIR}/*/vis/"
+log_info "  评测 JSON   : ${EVAL_JSON}"
+log_info "日志目录    : ${LOG_DIR}/"
+log_info "  baseline    : ${BASELINE_LOG}"
+log_info "  drift_corr  : ${DRIFT_LOG}"
+log_info "  eval        : ${EVAL_LOG}"
 
 if [ -n "$FAILED_STEPS" ]; then
     log_err "以下步骤失败：$FAILED_STEPS"
-    log_err "查看对应日志: ${LOG_DIR}/"
     exit 1
 else
     log_ok "全部步骤完成！"

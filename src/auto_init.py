@@ -82,16 +82,27 @@ class SAM2AutoInitialiser:
         log.info("SAM2 image predictor loaded.")
 
     def predict(self, image_rgb: np.ndarray) -> np.ndarray:
-        """Return a binary mask (H, W, bool) for the given RGB image."""
+        """Return a binary mask (H, W, bool) for the given RGB image.
+
+        Improvement over naive union: collect (score, mask) pairs, sort by
+        score descending, then greedily add masks only while the running union
+        area stays below max_area_ratio of the image.  This prevents the
+        merged mask from exploding to half the frame when many grid points
+        happen to land on background.
+        """
         self._build_predictor()
 
         H, W = image_rgb.shape[:2]
+        total_pixels = H * W
+        # Cap merged mask at 30% of image area to avoid over-segmentation
+        max_area_frac: float = self.cfg.get("sam2", {}).get("max_area_frac", 0.30)
+
         self._predictor.set_image(image_rgb)
 
         # Build grid of foreground prompt points
         grid_pts = self._make_grid(W, H, self.grid_size)
 
-        accepted: List[np.ndarray] = []
+        scored: List[tuple] = []  # (score, mask)
 
         with torch.inference_mode(), torch.autocast(self.device, dtype=torch.bfloat16):
             for x, y in grid_pts:
@@ -102,34 +113,50 @@ class SAM2AutoInitialiser:
                     point_labels=lbls,
                     multimask_output=True,
                 )
-                # masks: (3, H, W) bool; scores: (3,)
+                # masks: (3, H, W); dtype may be float under bfloat16 autocast
                 best_idx = int(np.argmax(scores))
-                best_mask = masks[best_idx]
+                best_mask = masks[best_idx].astype(bool)
                 best_score = float(scores[best_idx])
 
                 if best_score >= self.score_thresh and mask_area(best_mask) >= self.min_mask_area:
-                    accepted.append(best_mask)
+                    scored.append((best_score, best_mask))
 
-        if not accepted:
+        if not scored:
             log.warning(
                 "SAM2-Auto init: no mask passed the thresholds. "
                 "Falling back to centre-point mask."
             )
-            # Fallback: use the entire image centre as a single prompt
             pts = np.array([[W // 2, H // 2]], dtype=np.float32)
             lbls = np.array([1], dtype=np.int32)
             with torch.inference_mode():
                 masks, scores, _ = self._predictor.predict(
                     point_coords=pts, point_labels=lbls, multimask_output=True
                 )
-            accepted = [masks[int(np.argmax(scores))]]
+            return masks[int(np.argmax(scores))].astype(bool)
+
+        # Sort by score descending; greedily merge while area stays bounded
+        scored.sort(key=lambda t: t[0], reverse=True)
+        running_union = np.zeros((H, W), dtype=bool)
+        accepted: List[np.ndarray] = []
+        for score, mask in scored:
+            candidate = running_union | mask
+            if candidate.sum() / total_pixels <= max_area_frac:
+                running_union = candidate
+                accepted.append(mask)
+            # Once area budget exceeded, skip remaining (they have lower scores)
+
+        if not accepted:
+            # All masks individually exceed area budget — take the highest-score one
+            accepted = [scored[0][1]]
+            running_union = accepted[0].copy()
 
         merged = merge_masks(accepted, min_area=self.min_mask_area)
         log.info(
-            "SAM2-Auto init: %d/%d grid prompts accepted → merged area=%d px",
+            "SAM2-Auto init: %d/%d grid prompts accepted → merged area=%d px (%.1f%% of frame)",
             len(accepted),
             len(grid_pts),
             mask_area(merged),
+            mask_area(merged) / total_pixels * 100,
         )
         return merged
 
