@@ -6,7 +6,7 @@ Segmentation" which observes that SAM2's internal prediction quality can
 degrade over long sequences and proposes detecting such degradation and
 re-prompting the model.
 
-Two complementary drift signals are monitored:
+Three complementary drift signals are monitored:
 
   1. Confidence (iou_predictions proxy)
      SAM2's mask logit magnitude is used as a surrogate confidence score.
@@ -15,10 +15,13 @@ Two complementary drift signals are monitored:
   2. Area consistency
      A sudden jump or collapse in segmented area between consecutive
      observed frames is a reliable indicator of tracking failure.
-     When max(s_t/s_{t-1}, s_{t-1}/s_t) > area_ratio_thresh, trigger.
 
-Both checks are gated by an additional history: the detector maintains a
-short EMA of recent confidences to suppress single-frame false positives.
+  3. IoU consistency
+     Low mask-to-mask IoU between consecutive check frames.
+
+Additional robustness features:
+  - Cooldown period after each re-init to prevent cascade failures.
+  - Configurable minimum signal count (require N out of 3 signals to fire).
 
 Usage
 -----
@@ -39,21 +42,18 @@ log = logging.getLogger(__name__)
 class DriftDetector:
     """Detects tracking drift and decides whether to trigger re-initialisation.
 
-    Three complementary signals are monitored:
-      1. EMA-smoothed confidence drop (SAM2 sigmoid logits proxy)
-      2. Sudden mask area jump/collapse between consecutive check frames
-      3. Low mask-to-mask IoU between consecutive check frames
-
     Parameters
     ----------
     cfg : dict
         Loaded from configs/default.yaml.  Relevant sub-keys under ``drift``:
           - conf_thresh          (float, default 0.50)
           - area_ratio_thresh    (float, default 1.8)
-          - iou_thresh           (float, default 0.30) – IoU below this → drift
-          - ema_alpha            (float, default 0.4)  – EMA smoothing factor
-          - consecutive_low_conf (int,   default 2)    – consecutive low-conf
-                                                          frames needed to fire
+          - iou_thresh           (float, default 0.30)
+          - ema_alpha            (float, default 0.4)
+          - consecutive_low_conf (int,   default 2)
+          - cooldown_frames      (int,   default 10) – skip checks after reinit
+          - min_signals          (int,   default 1)  – how many signals must
+                                                       agree to fire drift
     """
 
     def __init__(self, cfg: dict) -> None:
@@ -61,16 +61,17 @@ class DriftDetector:
         self.conf_thresh: float = float(drift_cfg.get("conf_thresh", 0.50))
         self.area_ratio_thresh: float = float(drift_cfg.get("area_ratio_thresh", 1.8))
         self.iou_thresh: float = float(drift_cfg.get("iou_thresh", 0.30))
-        # EMA smoothing coefficient for confidence history
         self._ema_alpha: float = float(drift_cfg.get("ema_alpha", 0.4))
-        # Number of consecutive below-threshold frames required to fire
         self._consec_required: int = int(drift_cfg.get("consecutive_low_conf", 2))
+        self._cooldown_frames: int = int(drift_cfg.get("cooldown_frames", 4))
+        self._min_signals: int = int(drift_cfg.get("min_signals", 1))
 
         # Internal state
         self._ema_conf: Optional[float] = None
         self._low_conf_streak: int = 0
-        self._prev_mask: Optional[np.ndarray] = None  # mask at last check frame
+        self._prev_mask: Optional[np.ndarray] = None
         self._history: Deque[dict] = deque(maxlen=50)
+        self._cooldown_remaining: int = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -85,27 +86,29 @@ class DriftDetector:
     ) -> bool:
         """Return True if drift is detected at this frame.
 
-        Args:
-            frame_idx:   Current frame index (for logging).
-            mask:        Binary predicted mask (H, W bool/uint8).
-            confidence:  SAM2 proxy confidence score in [0, 1].
-            prev_area:   Pixel area of the mask at the previous check frame.
-                         Pass None on the very first call.
-
-        Returns:
-            True  → drift detected, caller should trigger re-init.
-            False → tracking looks healthy.
+        Respects the cooldown period: returns False unconditionally during
+        cooldown, while still updating internal state for accurate EMA.
         """
         current_mask = mask.astype(bool)
         current_area = int(current_mask.sum())
 
-        # ---- 1. Update EMA confidence ----
+        # ---- 1. Update EMA confidence (always, even during cooldown) ----
         if self._ema_conf is None:
             self._ema_conf = confidence
         else:
             self._ema_conf = (
                 self._ema_alpha * confidence + (1 - self._ema_alpha) * self._ema_conf
             )
+
+        # ---- Cooldown guard ----
+        if self._cooldown_remaining > 0:
+            self._cooldown_remaining -= 1
+            self._prev_mask = current_mask.copy()
+            log.debug(
+                "[DriftDetector] frame=%d COOLDOWN (%d remaining)",
+                frame_idx, self._cooldown_remaining,
+            )
+            return False
 
         # ---- 2. Confidence check ----
         conf_low = self._ema_conf < self.conf_thresh
@@ -123,7 +126,6 @@ class DriftDetector:
             area_ratio = max(current_area / prev_area, prev_area / current_area)
             area_drift = area_ratio > self.area_ratio_thresh
         elif prev_area is not None and prev_area > 0 and current_area == 0:
-            # Mask completely disappeared
             area_drift = True
             area_ratio = float("inf")
 
@@ -153,8 +155,9 @@ class DriftDetector:
             }
         )
 
-        # ---- 6. Decision ----
-        is_drift = conf_drift or area_drift or iou_drift
+        # ---- 6. Decision: require min_signals to agree ----
+        n_active = sum([conf_drift, area_drift, iou_drift])
+        is_drift = n_active >= self._min_signals
 
         if is_drift:
             reasons = []
@@ -172,9 +175,9 @@ class DriftDetector:
                     f"iou={iou_score:.3f} < {self.iou_thresh}"
                 )
             log.debug(
-                "[DriftDetector] frame=%d DRIFT: %s", frame_idx, "; ".join(reasons)
+                "[DriftDetector] frame=%d DRIFT (%d/%d signals): %s",
+                frame_idx, n_active, 3, "; ".join(reasons),
             )
-            # Reset streak so we don't fire every subsequent frame unnecessarily
             self._low_conf_streak = 0
         else:
             log.debug(
@@ -188,10 +191,11 @@ class DriftDetector:
         return is_drift
 
     def reset(self) -> None:
-        """Reset internal state (call after each re-initialisation)."""
+        """Reset internal state and activate cooldown (call after re-init)."""
         self._ema_conf = None
         self._low_conf_streak = 0
         self._prev_mask = None
+        self._cooldown_remaining = self._cooldown_frames
 
     # ------------------------------------------------------------------
     # Diagnostics
