@@ -21,14 +21,14 @@ export LD_LIBRARY_PATH="${CONDA_LIB}:${LD_LIBRARY_PATH}"
 #   "same_gpu" → 两任务同一张卡并行（显存充足时，如 3090 空余 >18GB）
 #   "dual_gpu" → 两任务分别用两张不同的卡（推荐，速度最快）
 # ────────────────────────────────────────────────────────────
-PARALLEL_MODE="off"   # off | same_gpu | dual_gpu
+PARALLEL_MODE="dual_gpu"   # off | same_gpu | dual_gpu
 
 # 串行 / same_gpu 模式时使用的单卡
 CUDA_DEVICE=3
 
 # dual_gpu 模式时分别指定两张卡
-CUDA_DEVICE_BASELINE=3     # baseline（无漂移纠偏）用这张卡（空余 24GB）
-CUDA_DEVICE_DRIFT=0        # drift_corr（漂移纠偏）用这张卡（空余 24GB）
+CUDA_DEVICE_BASELINE=0     # baseline（无漂移纠偏）用这张卡（空余 24GB）
+CUDA_DEVICE_DRIFT=2        # drift_corr（漂移纠偏）用这张卡（空余 24GB）
 
 # ────────────────────────────────────────────────────────────
 # ★ 序列选择

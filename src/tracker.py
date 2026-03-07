@@ -268,10 +268,12 @@ class CoralTracker:
         # ------------------------------------------------------------------
         # Step 1: Init SAM2 video state (loads frames into memory)
         # ------------------------------------------------------------------
+        sam2_cfg = self.cfg.get("sam2", {})
+        offload_video = sam2_cfg.get("offload_video_to_cpu", True)
         with torch.inference_mode(), _maybe_autocast(self.device):
             inference_state = self.video_predictor.init_state(
                 video_path=images_dir,
-                offload_video_to_cpu=False,
+                offload_video_to_cpu=offload_video,
                 offload_state_to_cpu=False,
             )
 

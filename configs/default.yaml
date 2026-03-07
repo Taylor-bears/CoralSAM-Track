@@ -25,6 +25,10 @@ sam2:
   # After installing sam2, this resolves to sam2/configs/sam2.1/sam2.1_hiera_l.yaml
   config: configs/sam2.1/sam2.1_hiera_l.yaml
   model_size: large   # tiny | small | base_plus | large
+  # Keep video frames on CPU and move to GPU per-frame during tracking.
+  # True = much lower GPU memory (recommended for long videos / shared GPU).
+  # False = all frames on GPU, faster but can OOM on 24GB with 400+ frames.
+  offload_video_to_cpu: true
   # Grid prompting for SAM2-Auto init (only used when GT first frame unavailable)
   grid_size: 16       # NxN grid of candidate points on first frame
   min_mask_area: 500  # pixels – discard tiny spurious masks

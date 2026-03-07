@@ -26,6 +26,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import torch
+
 # Allow running from project root
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -172,6 +174,8 @@ def main() -> None:
             all_timing[seq] = result.timing
         except Exception as exc:
             log.error("Failed on %s: %s", seq, exc, exc_info=True)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     # Print aggregate summary
     if len(all_timing) > 1:
