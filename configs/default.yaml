@@ -77,8 +77,9 @@ drift:
   # Zone-based reinit limiting: prevent keyframe rewind loops.
   # A "zone" groups nearby frames; reinit attempts are capped per zone.
   zone_size: 20                 # frames per zone
-  max_rewinds_per_zone: 2       # keyframe rewind attempts before falling through to auto_init
-  max_reinits_per_zone: 5       # total reinits (soft + hard + auto_init) before zone is skipped
+  max_rewinds_per_zone: 3       # keyframe rewind attempts before falling through to auto_init
+  max_reinits_per_zone: 5       # hard reinits per zone before zone is skipped (soft reinits are free)
+  end_skip_frac: 0.05           # skip drift detection in last 5% of sequence
 
 # ---------------------------------------------------------------------------
 # Keyframe checkpointing — two-tier reinit
@@ -102,6 +103,13 @@ bidirectional_refinement:
   enabled: true
   conf_margin: 0.02
   min_improvement_frames: 5
+  # Baseline safety net: re-propagate from GT init frame. When the baseline
+  # and drift-corrected masks diverge (IoU < safety_iou_thresh), prefer the
+  # baseline if it has a non-trivial mask. This catches cases where drift
+  # correction (e.g. auto_init) tracked the wrong target.
+  safety_net: true
+  safety_iou_thresh: 0.3   # below this IoU, masks are considered diverged
+  anchor_agree_thresh: 0.6 # Pass 1: IoU above this means masks agree (no replacement)
 
 # ---------------------------------------------------------------------------
 # Post-processing

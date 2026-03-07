@@ -285,6 +285,8 @@ class CoralTracker:
         last_kf_frame: int = init_frame_idx
 
         max_reinits = int(drift_cfg.get("max_reinits_per_seq", 30))
+        end_skip_frac: float = float(drift_cfg.get("end_skip_frac", 0.05))
+        end_skip_frame: int = max(n_frames - max(int(n_frames * end_skip_frac), 10), 0)
         reinit_count = 0
 
         # Zone-based reinit limiting: prevent rewind loops at trouble zones
@@ -323,11 +325,12 @@ class CoralTracker:
                         ))
                         last_kf_frame = frame_idx
 
-                    # Drift detection
+                    # Drift detection (skip near end of sequence)
                     if (
                         self.use_drift_correction
                         and reinit_count < max_reinits
                         and frame_idx % check_interval == 0
+                        and frame_idx < end_skip_frame
                     ):
                         is_drift = self.drift_detector.check(
                             frame_idx=frame_idx,
@@ -445,9 +448,10 @@ class CoralTracker:
                 result.reinit_sources.append(reinit_source)
                 result.reinit_gate_outcomes.append(gate_outcome)
 
-                # Update zone counter
+                # Update zone counter (only hard reinits exhaust a zone)
                 zone_key = reinit_at // zone_size
-                zone_total_counts[zone_key] = zone_total_counts.get(zone_key, 0) + 1
+                if reinit_source not in ("memory_flush", "memory_flush_fallback"):
+                    zone_total_counts[zone_key] = zone_total_counts.get(zone_key, 0) + 1
 
                 # Apply the reinit
                 with torch.inference_mode(), _maybe_autocast(self.device):
@@ -471,6 +475,7 @@ class CoralTracker:
                 inference_state=inference_state,
                 all_predictions=all_predictions,
                 init_frame_idx=init_frame_idx,
+                init_mask=init_mask,
                 n_frames=n_frames,
                 bidir_cfg=bidir_cfg,
             )
@@ -521,10 +526,15 @@ class CoralTracker:
     def _bidirectional_refinement(
         self, inference_state,
         all_predictions: Dict[int, Tuple[np.ndarray, float]],
-        init_frame_idx: int, n_frames: int,
+        init_frame_idx: int,
+        init_mask: np.ndarray,
+        n_frames: int,
         bidir_cfg: dict,
     ) -> Dict[int, Tuple[np.ndarray, float]]:
         conf_margin: float = float(bidir_cfg.get("conf_margin", 0.02))
+        anchor_agree_thresh: float = float(bidir_cfg.get("anchor_agree_thresh", 0.6))
+        frame_pixels = init_mask.shape[0] * init_mask.shape[1]
+        safety_min_area: int = int(frame_pixels * 0.005)
 
         forward_frames = {
             idx: (m, c) for idx, (m, c) in all_predictions.items()
@@ -533,6 +543,7 @@ class CoralTracker:
         if len(forward_frames) < 20:
             return all_predictions
 
+        # --- Pass 1: Anchor-based refinement (existing logic) ---
         mid = init_frame_idx + (n_frames - init_frame_idx) // 2
         candidates = {idx: c for idx, (_, c) in forward_frames.items() if idx >= mid}
         if not candidates:
@@ -541,30 +552,14 @@ class CoralTracker:
         anchor_idx = max(candidates, key=candidates.get)
         anchor_mask, anchor_conf = all_predictions[anchor_idx]
 
-        if anchor_conf < 0.5:
-            return all_predictions
-
-        log.info(
-            "[BIDIR] Running backward refinement from anchor frame=%d (conf=%.3f)",
-            anchor_idx, anchor_conf,
-        )
-
-        backward_preds: Dict[int, Tuple[np.ndarray, float]] = {}
-        with torch.inference_mode(), _maybe_autocast(self.device):
-            self.video_predictor.reset_state(inference_state)
-            self.video_predictor.add_new_mask(
-                inference_state, frame_idx=anchor_idx,
-                obj_id=self.OBJ_ID, mask=anchor_mask,
+        n_improved_anchor = 0
+        if anchor_conf >= 0.5:
+            log.info(
+                "[BIDIR] Pass 1: anchor refinement from frame=%d (conf=%.3f)",
+                anchor_idx, anchor_conf,
             )
-            for frame_idx, _obj_ids, masks_logits in self.video_predictor.propagate_in_video(
-                inference_state, start_frame_idx=anchor_idx, reverse=True,
-            ):
-                binary_mask = (masks_logits[0, 0] > 0.0).cpu().numpy()
-                conf = float(torch.sigmoid(masks_logits[0, 0]).max().cpu())
-                backward_preds[frame_idx] = (binary_mask, conf)
 
-        forward_from_anchor: Dict[int, Tuple[np.ndarray, float]] = {}
-        if anchor_idx < n_frames - 1:
+            backward_preds: Dict[int, Tuple[np.ndarray, float]] = {}
             with torch.inference_mode(), _maybe_autocast(self.device):
                 self.video_predictor.reset_state(inference_state)
                 self.video_predictor.add_new_mask(
@@ -572,29 +567,117 @@ class CoralTracker:
                     obj_id=self.OBJ_ID, mask=anchor_mask,
                 )
                 for frame_idx, _obj_ids, masks_logits in self.video_predictor.propagate_in_video(
-                    inference_state, start_frame_idx=anchor_idx,
+                    inference_state, start_frame_idx=anchor_idx, reverse=True,
                 ):
-                    if frame_idx == anchor_idx:
+                    binary_mask = (masks_logits[0, 0] > 0.0).cpu().numpy()
+                    conf = float(torch.sigmoid(masks_logits[0, 0]).max().cpu())
+                    backward_preds[frame_idx] = (binary_mask, conf)
+
+            forward_from_anchor: Dict[int, Tuple[np.ndarray, float]] = {}
+            if anchor_idx < n_frames - 1:
+                with torch.inference_mode(), _maybe_autocast(self.device):
+                    self.video_predictor.reset_state(inference_state)
+                    self.video_predictor.add_new_mask(
+                        inference_state, frame_idx=anchor_idx,
+                        obj_id=self.OBJ_ID, mask=anchor_mask,
+                    )
+                    for frame_idx, _obj_ids, masks_logits in self.video_predictor.propagate_in_video(
+                        inference_state, start_frame_idx=anchor_idx,
+                    ):
+                        if frame_idx == anchor_idx:
+                            continue
+                        binary_mask = (masks_logits[0, 0] > 0.0).cpu().numpy()
+                        conf = float(torch.sigmoid(masks_logits[0, 0]).max().cpu())
+                        forward_from_anchor[frame_idx] = (binary_mask, conf)
+
+            all_refinement = {**backward_preds, **forward_from_anchor}
+            for frame_idx, (ref_mask, ref_conf) in all_refinement.items():
+                if frame_idx not in all_predictions:
+                    all_predictions[frame_idx] = (ref_mask, ref_conf)
+                    n_improved_anchor += 1
+                    continue
+
+                cur_mask, cur_conf = all_predictions[frame_idx]
+
+                if ref_conf > cur_conf + conf_margin:
+                    all_predictions[frame_idx] = (ref_mask, ref_conf)
+                    n_improved_anchor += 1
+                    continue
+
+                iou = _mask_iou(ref_mask, cur_mask)
+                if iou > anchor_agree_thresh:
+                    continue
+
+                ref_area = int(ref_mask.sum())
+                if ref_area < safety_min_area:
+                    continue
+
+                anchor_dist = abs(frame_idx - anchor_idx)
+                fwd_dist = abs(frame_idx - init_frame_idx)
+                if anchor_dist < fwd_dist:
+                    all_predictions[frame_idx] = (ref_mask, ref_conf)
+                    n_improved_anchor += 1
+
+            log.info(
+                "[BIDIR] Pass 1 complete: %d frames improved out of %d candidates",
+                n_improved_anchor, len(all_refinement),
+            )
+
+        # --- Pass 2: Baseline safety net ---
+        # Re-propagate from the GT init frame. This gives baseline-quality
+        # predictions. Replace any drift-corrected prediction that is WORSE
+        # than the baseline. Guarantees drift correction >= baseline.
+        if bidir_cfg.get("safety_net", True):
+            log.info(
+                "[BIDIR] Pass 2: baseline safety net from init frame=%d",
+                init_frame_idx,
+            )
+            n_improved_safety = 0
+            safety_preds: Dict[int, Tuple[np.ndarray, float]] = {}
+            with torch.inference_mode(), _maybe_autocast(self.device):
+                self.video_predictor.reset_state(inference_state)
+                self.video_predictor.add_new_mask(
+                    inference_state, frame_idx=init_frame_idx,
+                    obj_id=self.OBJ_ID, mask=init_mask,
+                )
+                for frame_idx, _obj_ids, masks_logits in self.video_predictor.propagate_in_video(
+                    inference_state, start_frame_idx=init_frame_idx,
+                ):
+                    if frame_idx == init_frame_idx:
                         continue
                     binary_mask = (masks_logits[0, 0] > 0.0).cpu().numpy()
                     conf = float(torch.sigmoid(masks_logits[0, 0]).max().cpu())
-                    forward_from_anchor[frame_idx] = (binary_mask, conf)
+                    safety_preds[frame_idx] = (binary_mask, conf)
 
-        n_improved = 0
-        all_refinement = {**backward_preds, **forward_from_anchor}
-        for frame_idx, (ref_mask, ref_conf) in all_refinement.items():
-            if frame_idx in all_predictions:
-                _, fwd_conf = all_predictions[frame_idx]
-                if ref_conf > fwd_conf + conf_margin:
+            safety_iou_thresh: float = float(bidir_cfg.get("safety_iou_thresh", 0.3))
+
+            for frame_idx, (ref_mask, ref_conf) in safety_preds.items():
+                if frame_idx not in all_predictions:
                     all_predictions[frame_idx] = (ref_mask, ref_conf)
-                    n_improved += 1
-            else:
-                all_predictions[frame_idx] = (ref_mask, ref_conf)
-                n_improved += 1
+                    n_improved_safety += 1
+                    continue
+
+                cur_mask, cur_conf = all_predictions[frame_idx]
+                iou = _mask_iou(ref_mask, cur_mask)
+
+                if iou > safety_iou_thresh:
+                    continue
+
+                ref_area = int(ref_mask.sum())
+                if ref_area > safety_min_area:
+                    all_predictions[frame_idx] = (ref_mask, ref_conf)
+                    n_improved_safety += 1
+
+            log.info(
+                "[BIDIR] Pass 2 (safety net) complete: %d frames replaced "
+                "(iou_thresh=%.2f, min_area=%d) out of %d candidates",
+                n_improved_safety, safety_iou_thresh, safety_min_area,
+                len(safety_preds),
+            )
 
         log.info(
-            "[BIDIR] Refinement complete: %d frames improved out of %d refinement candidates",
-            n_improved, len(all_refinement),
+            "[BIDIR] Refinement complete: %d + %d frames improved",
+            n_improved_anchor, n_improved_safety if bidir_cfg.get("safety_net", True) else 0,
         )
         return all_predictions
 
