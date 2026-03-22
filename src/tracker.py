@@ -440,20 +440,20 @@ class CoralTracker:
                 base_area = mask_area(m_base_mask)
                 gate_metrics: Dict[str, Any] = {}
                 rewind_idx: Optional[int] = None
+                hard_reinit_enabled = bool(drift_cfg.get("hard_reinit_enabled", True))
+                use_soft_reinit = (kf_iou > kf_divergence_thresh and base_area > 0) or not hard_reinit_enabled
 
-                if kf_iou > kf_divergence_thresh and base_area > 0:
+                if use_soft_reinit:
                     # --- SOFT REINIT: memory flush ---
-                    # Mask is still roughly on target; the problem is stale memory.
-                    # Reset SAM2 memory and reprompt with current mask.
-                    # No gate — this is generally safe and beneficial.
+                    # Mask is still roughly on target, or hard reinit is disabled for ablation.
                     reinit_source = "memory_flush"
                     reinit_mask = m_base_mask
                     actual_start = reinit_at
                     gate_outcome = "skipped_flush"
 
                     log.info(
-                        "[REINIT SOFT] #%d frame=%d (%s) kf_iou=%.3f — memory flush",
-                        reinit_count, reinit_at, frame_names[reinit_at], kf_iou,
+                        "[REINIT SOFT] #%d frame=%d (%s) kf_iou=%.3f hard_enabled=%s -> memory flush",
+                        reinit_count, reinit_at, frame_names[reinit_at], kf_iou, hard_reinit_enabled,
                     )
                 else:
                     # --- HARD REINIT: keyframe rewind (zone-limited) ---
@@ -958,7 +958,7 @@ class CoralTracker:
     def _save_results(self, data_root, seq_name, frame_paths, result):
         out_cfg = self.cfg.get("output", {})
         base_dir = out_cfg.get("base_dir", "outputs")
-        drift_tag = "with_drift_corr" if self.use_drift_correction else "baseline"
+        drift_tag = out_cfg.get("mode_tag") or ("with_drift_corr" if self.use_drift_correction else "baseline")
 
         mask_dir = Path(base_dir) / drift_tag / "masks" / seq_name
         vis_dir = Path(base_dir) / drift_tag / "vis" / seq_name
