@@ -69,6 +69,7 @@ drift:
   reinit_gate_delta_iou: 0.05
   # Short cooldown: allow repeated memory flushes (which help video97/98).
   cooldown_frames: 4
+  history_size: 1000000        # keep full drift-check history for diagnostics export
   # min_signals=1: any single drift signal triggers. Safety is handled
   # by the two-tier reinit strategy, not by suppressing detection.
   min_signals: 1

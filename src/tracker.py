@@ -12,11 +12,14 @@ Wraps SAM2 VideoPredictor and integrates:
 from __future__ import annotations
 
 import contextlib
+import csv
+import json
 import logging
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -48,6 +51,25 @@ def _mask_iou(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> float:
     inter = int((a_bool & b_bool).sum())
     union = int((a_bool | b_bool).sum())
     return inter / union if union > 0 else 0.0
+
+
+def _write_csv_rows(path: Path, rows: List[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            f.write("")
+        return
+
+    fieldnames: List[str] = []
+    for row in rows:
+        for key in row:
+            if key not in fieldnames:
+                fieldnames.append(key)
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 @contextlib.contextmanager
@@ -104,9 +126,16 @@ class SequenceResult:
         self.seq_name = seq_name
         self.masks: Dict[str, np.ndarray] = {}
         self.confidences: Dict[str, float] = {}
+        self.init_frame_idx: Optional[int] = None
+        self.init_frame_name: Optional[str] = None
+        self.keyframe_count: int = 0
         self.reinit_frames: List[str] = []
         self.reinit_sources: List[str] = []
         self.reinit_gate_outcomes: List[str] = []
+        self.reinit_events: List[Dict[str, Any]] = []
+        self.drift_check_history: List[Dict[str, Any]] = []
+        self.per_frame_stats: List[Dict[str, Any]] = []
+        self.summary: Dict[str, Any] = {}
         self.timing: Dict = {}
 
     def __repr__(self) -> str:
@@ -123,6 +152,34 @@ class SequenceResult:
             f"frames={len(self.masks)}, re_inits={len(self.reinit_frames)}"
             f"[{src_summary}], gate=[{gate_summary}], fps={self.timing.get('fps', 0):.1f})"
         )
+
+    def build_summary(self) -> Dict[str, Any]:
+        confs = [float(v) for v in self.confidences.values()]
+        areas = [int(m.sum()) for m in self.masks.values()]
+        drift_checks = self.drift_check_history
+        drift_events = sum(1 for row in drift_checks if row.get("is_drift"))
+
+        summary = {
+            "seq_name": self.seq_name,
+            "init_frame_idx": self.init_frame_idx,
+            "init_frame_name": self.init_frame_name,
+            "n_frames": len(self.masks),
+            "keyframe_count": int(self.keyframe_count),
+            "reinit_count": len(self.reinit_frames),
+            "reinit_source_counts": dict(Counter(self.reinit_sources)),
+            "reinit_gate_counts": dict(Counter(self.reinit_gate_outcomes)),
+            "drift_checks": len(drift_checks),
+            "drift_events": drift_events,
+            "mean_confidence": round(float(np.mean(confs)), 4) if confs else 0.0,
+            "median_confidence": round(float(np.median(confs)), 4) if confs else 0.0,
+            "min_confidence": round(float(np.min(confs)), 4) if confs else 0.0,
+            "max_confidence": round(float(np.max(confs)), 4) if confs else 0.0,
+            "mean_area_pixels": round(float(np.mean(areas)), 2) if areas else 0.0,
+            "median_area_pixels": round(float(np.median(areas)), 2) if areas else 0.0,
+            "timing": self.timing,
+        }
+        self.summary = summary
+        return summary
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +271,9 @@ class CoralTracker:
 
         result = SequenceResult(seq_name)
         frame_names = [Path(p).stem for p in frame_paths]
+        drift_history_start = (
+            len(self.drift_detector.get_history()) if self.use_drift_correction else 0
+        )
 
         # Step 1: Init SAM2 video state
         sam2_cfg = self.cfg.get("sam2", {})
@@ -231,6 +291,8 @@ class CoralTracker:
             data_root, seq_name, frame_paths, frame_names
         )
         self._gt_guard_active = True
+        result.init_frame_idx = init_frame_idx
+        result.init_frame_name = frame_names[init_frame_idx]
 
         # Step 3a: Backward propagation (frames before init)
         all_predictions: Dict[int, Tuple[np.ndarray, float]] = {}
@@ -298,6 +360,7 @@ class CoralTracker:
 
         while segment_start < n_frames:
             reinit_at: Optional[int] = None
+            trigger_meta: Dict[str, Any] = {}
             t_seg_start = time.perf_counter()
 
             with torch.inference_mode(), _maybe_autocast(self.device):
@@ -339,6 +402,9 @@ class CoralTracker:
                             prev_area=prev_area,
                         )
                         if is_drift:
+                            recent_history = self.drift_detector.get_history()
+                            if recent_history:
+                                trigger_meta = dict(recent_history[-1])
                             zone_key = frame_idx // zone_size
                             if zone_total_counts.get(zone_key, 0) >= max_reinits_per_zone:
                                 log.info(
@@ -372,6 +438,8 @@ class CoralTracker:
                 recent_kf = keyframes[-1]
                 kf_iou = _mask_iou(m_base_mask, recent_kf.mask)
                 base_area = mask_area(m_base_mask)
+                gate_metrics: Dict[str, Any] = {}
+                rewind_idx: Optional[int] = None
 
                 if kf_iou > kf_divergence_thresh and base_area > 0:
                     # --- SOFT REINIT: memory flush ---
@@ -418,7 +486,7 @@ class CoralTracker:
                         delta_conf = float(drift_cfg.get("reinit_gate_delta_conf", 0.05))
                         delta_iou = float(drift_cfg.get("reinit_gate_delta_iou", 0.05))
 
-                        accept = self._evaluate_reinit_gate(
+                        gate_metrics = self._evaluate_reinit_gate(
                             inference_state=inference_state,
                             reinit_at=reinit_at,
                             reinit_mask=reinit_mask,
@@ -428,6 +496,7 @@ class CoralTracker:
                             delta_conf=delta_conf,
                             delta_iou=delta_iou,
                         )
+                        accept = bool(gate_metrics["accepted"])
                         if accept:
                             gate_outcome = "accepted"
                             actual_start = rewind_idx if rewind_idx is not None else reinit_at
@@ -447,6 +516,43 @@ class CoralTracker:
 
                 result.reinit_sources.append(reinit_source)
                 result.reinit_gate_outcomes.append(gate_outcome)
+                result.reinit_events.append(
+                    {
+                        "event_idx": len(result.reinit_events) + 1,
+                        "trigger_frame_idx": int(reinit_at),
+                        "trigger_frame": frame_names[reinit_at],
+                        "actual_start_idx": int(actual_start),
+                        "actual_start_frame": frame_names[actual_start],
+                        "rewind_distance": int(reinit_at - actual_start),
+                        "zone_key": int(reinit_at // zone_size),
+                        "source": reinit_source,
+                        "gate_outcome": gate_outcome,
+                        "base_confidence": round(float(conf_base), 4),
+                        "base_area_pixels": int(base_area),
+                        "keyframe_iou": round(float(kf_iou), 4),
+                        "drift_confidence": round(float(trigger_meta.get("conf", conf_base)), 4),
+                        "drift_ema_confidence": round(float(trigger_meta.get("ema_conf", conf_base)), 4),
+                        "drift_area_pixels": int(trigger_meta.get("area", base_area)),
+                        "drift_area_ratio": (
+                            None
+                            if trigger_meta.get("area_ratio") is None
+                            else round(float(trigger_meta["area_ratio"]), 4)
+                        ),
+                        "drift_iou_prev": (
+                            None
+                            if trigger_meta.get("iou") is None
+                            else round(float(trigger_meta["iou"]), 4)
+                        ),
+                        "conf_signal": bool(trigger_meta.get("conf_drift", False)),
+                        "area_signal": bool(trigger_meta.get("area_drift", False)),
+                        "iou_signal": bool(trigger_meta.get("iou_drift", False)),
+                        "gate_accept": gate_metrics.get("accepted"),
+                        "gate_conf_reinit": gate_metrics.get("conf_reinit"),
+                        "gate_conf_base": gate_metrics.get("conf_base"),
+                        "gate_iou_reinit_prev": gate_metrics.get("iou_reinit_prev"),
+                        "gate_iou_base_prev": gate_metrics.get("iou_base_prev"),
+                    }
+                )
 
                 # Update zone counter (only hard reinits exhaust a zone)
                 zone_key = reinit_at // zone_size
@@ -494,6 +600,52 @@ class CoralTracker:
             result.masks[fname] = mask.astype(bool)
             result.confidences[fname] = conf
 
+        frame_pixels = int(init_mask.shape[0] * init_mask.shape[1])
+        event_by_frame = {
+            event["trigger_frame"]: event for event in result.reinit_events
+        }
+        for fidx in sorted(all_predictions):
+            fname = frame_names[fidx]
+            mask = result.masks[fname]
+            area = int(mask.sum())
+            conf = float(result.confidences[fname])
+            event = event_by_frame.get(fname, {})
+            result.per_frame_stats.append(
+                {
+                    "frame_idx": int(fidx),
+                    "frame_name": fname,
+                    "is_init_frame": bool(fidx == init_frame_idx),
+                    "is_reinit_trigger": bool(fname in result.reinit_frames),
+                    "reinit_source": event.get("source"),
+                    "confidence": round(conf, 4),
+                    "mask_area_pixels": area,
+                    "mask_area_ratio": round(area / frame_pixels, 6) if frame_pixels else 0.0,
+                    "distance_from_init": int(fidx - init_frame_idx),
+                }
+            )
+
+        if self.use_drift_correction:
+            result.drift_check_history = [
+                {
+                    "frame_idx": int(row["frame_idx"]),
+                    "confidence": round(float(row["conf"]), 4),
+                    "ema_confidence": round(float(row["ema_conf"]), 4),
+                    "area_pixels": int(row["area"]),
+                    "area_ratio": (
+                        None if row["area_ratio"] is None else round(float(row["area_ratio"]), 4)
+                    ),
+                    "iou_prev": None if row["iou"] is None else round(float(row["iou"]), 4),
+                    "conf_signal": bool(row["conf_drift"]),
+                    "area_signal": bool(row["area_drift"]),
+                    "iou_signal": bool(row["iou_drift"]),
+                    "is_drift": bool(
+                        row["conf_drift"] or row["area_drift"] or row["iou_drift"]
+                    ),
+                }
+                for row in self.drift_detector.get_history()[drift_history_start:]
+            ]
+        result.keyframe_count = len(keyframes)
+
         n_processed = len(result.masks)
         if frame_timings:
             total_s = sum(frame_timings)
@@ -513,6 +665,7 @@ class CoralTracker:
             seq_name, n_processed, result.timing.get("fps", 0),
             len(result.reinit_frames), len(keyframes),
         )
+        result.build_summary()
 
         if save_output:
             self._save_results(data_root, seq_name, frame_paths, result)
@@ -754,7 +907,7 @@ class CoralTracker:
         self, inference_state, reinit_at, reinit_mask,
         m_base_mask, conf_base, m_prev_mask,
         delta_conf, delta_iou,
-    ) -> bool:
+    ) -> Dict[str, Any]:
         """Gate for hard reinit only. Tests if the reinit mask produces a
         better prediction than the current baseline."""
         with torch.inference_mode(), _maybe_autocast(self.device):
@@ -794,7 +947,13 @@ class CoralTracker:
         with torch.inference_mode(), _maybe_autocast(self.device):
             self.video_predictor.reset_state(inference_state)
 
-        return accept
+        return {
+            "accepted": bool(accept),
+            "conf_reinit": round(float(conf_reinit), 4),
+            "conf_base": round(float(conf_base), 4),
+            "iou_reinit_prev": round(float(iou_reinit_prev), 4),
+            "iou_base_prev": round(float(iou_base_prev), 4),
+        }
 
     def _save_results(self, data_root, seq_name, frame_paths, result):
         out_cfg = self.cfg.get("output", {})
@@ -803,6 +962,7 @@ class CoralTracker:
 
         mask_dir = Path(base_dir) / drift_tag / "masks" / seq_name
         vis_dir = Path(base_dir) / drift_tag / "vis" / seq_name
+        diag_dir = Path(base_dir) / drift_tag / "diagnostics" / seq_name
 
         vis_color = tuple(out_cfg.get("vis_color", [0, 255, 128]))
         vis_alpha = float(out_cfg.get("vis_alpha", 0.5))
@@ -823,7 +983,14 @@ class CoralTracker:
                         color=vis_color, alpha=vis_alpha, info_text=info,
                     )
 
-        log.info("Results saved → masks: %s  vis: %s", mask_dir, vis_dir)
+        diag_dir.mkdir(parents=True, exist_ok=True)
+        with open(diag_dir / "summary.json", "w", encoding="utf-8") as f:
+            json.dump(result.summary or result.build_summary(), f, indent=2, ensure_ascii=False)
+        _write_csv_rows(diag_dir / "frame_stats.csv", result.per_frame_stats)
+        _write_csv_rows(diag_dir / "reinit_events.csv", result.reinit_events)
+        _write_csv_rows(diag_dir / "drift_checks.csv", result.drift_check_history)
+
+        log.info("Results saved -> masks: %s  vis: %s  diagnostics: %s", mask_dir, vis_dir, diag_dir)
 
     # ------------------------------------------------------------------
     # Batch processing

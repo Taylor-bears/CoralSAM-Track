@@ -19,12 +19,15 @@ python scripts/demo.py --all
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import os
 import sys
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
+from statistics import mean
 
 import torch
 
@@ -55,6 +58,93 @@ def _setup_file_logging(log_path: Path) -> None:
     )
     logging.getLogger().addHandler(fh)
     log.info("Logging to file: %s", log_path)
+
+
+def _write_csv_rows(path: Path, rows) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            f.write("")
+        return
+
+    fieldnames = []
+    for row in rows:
+        for key in row:
+            if key not in fieldnames:
+                fieldnames.append(key)
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _build_run_summary(mode_label: str, all_results: dict) -> dict:
+    per_sequence_rows = []
+    per_sequence = {}
+
+    for seq_name, result in sorted(all_results.items()):
+        summary = result.summary or result.build_summary()
+        timing = summary.get("timing", {})
+        source_counts = summary.get("reinit_source_counts", {})
+        gate_counts = summary.get("reinit_gate_counts", {})
+        row = {
+            "seq_name": seq_name,
+            "n_frames": summary.get("n_frames", 0),
+            "fps": timing.get("fps", 0.0),
+            "total_s": timing.get("total_s", 0.0),
+            "mean_ms_per_frame": timing.get("mean_ms_per_frame", 0.0),
+            "init_frame_idx": summary.get("init_frame_idx"),
+            "reinit_count": summary.get("reinit_count", 0),
+            "keyframe_count": summary.get("keyframe_count", 0),
+            "drift_checks": summary.get("drift_checks", 0),
+            "drift_events": summary.get("drift_events", 0),
+            "mean_confidence": summary.get("mean_confidence", 0.0),
+            "median_confidence": summary.get("median_confidence", 0.0),
+            "mean_area_pixels": summary.get("mean_area_pixels", 0.0),
+            "memory_flush": source_counts.get("memory_flush", 0),
+            "memory_flush_fallback": source_counts.get("memory_flush_fallback", 0),
+            "keyframe_rewind": source_counts.get("keyframe_rewind", 0),
+            "auto_init": source_counts.get("auto_init", 0),
+            "gate_accepted": gate_counts.get("accepted", 0),
+            "gate_rejected": gate_counts.get("rejected", 0),
+            "gate_skipped": gate_counts.get("skipped", 0) + gate_counts.get("skipped_flush", 0),
+        }
+        per_sequence_rows.append(row)
+        per_sequence[seq_name] = summary
+
+    overall = {
+        "mode": mode_label,
+        "n_sequences": len(per_sequence_rows),
+        "mean_fps": round(mean(row["fps"] for row in per_sequence_rows), 4) if per_sequence_rows else 0.0,
+        "mean_ms_per_frame": round(
+            mean(row["mean_ms_per_frame"] for row in per_sequence_rows), 4
+        ) if per_sequence_rows else 0.0,
+        "total_runtime_s": round(sum(row["total_s"] for row in per_sequence_rows), 4),
+        "total_reinits": int(sum(row["reinit_count"] for row in per_sequence_rows)),
+        "total_drift_checks": int(sum(row["drift_checks"] for row in per_sequence_rows)),
+        "total_drift_events": int(sum(row["drift_events"] for row in per_sequence_rows)),
+        "reinit_source_counts": dict(
+            Counter(
+                key
+                for row in per_sequence_rows
+                for key, value in {
+                    "memory_flush": row["memory_flush"],
+                    "memory_flush_fallback": row["memory_flush_fallback"],
+                    "keyframe_rewind": row["keyframe_rewind"],
+                    "auto_init": row["auto_init"],
+                }.items()
+                for _ in range(int(value))
+            )
+        ),
+    }
+
+    return {
+        "mode": mode_label,
+        "overall": overall,
+        "per_sequence": per_sequence,
+        "table_rows": per_sequence_rows,
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -161,6 +251,7 @@ def main() -> None:
         use_drift_correction=not args.no_drift_correction,
     )
 
+    all_results = {}
     all_timing = {}
     for seq in sequences:
         log.info("--- Starting sequence: %s ---", seq)
@@ -171,6 +262,7 @@ def main() -> None:
                 save_output=True,
             )
             print_summary(seq, result)
+            all_results[seq] = result
             all_timing[seq] = result.timing
         except Exception as exc:
             log.error("Failed on %s: %s", seq, exc, exc_info=True)
@@ -179,7 +271,6 @@ def main() -> None:
 
     # Print aggregate summary
     if len(all_timing) > 1:
-        from statistics import mean
         valid = [v for v in all_timing.values() if v]
         if valid:
             avg_fps = mean(v["fps"] for v in valid if "fps" in v)
@@ -193,6 +284,14 @@ def main() -> None:
     with open(timing_path, "w") as f:
         json.dump(all_timing, f, indent=2)
     log.info("Timing saved to %s", timing_path)
+
+    run_summary = _build_run_summary(folder_tag, all_results)
+    run_summary_json = Path(out_base) / folder_tag / "run_summary.json"
+    run_summary_csv = Path(out_base) / folder_tag / "run_summary.csv"
+    with open(run_summary_json, "w", encoding="utf-8") as f:
+        json.dump(run_summary, f, indent=2, ensure_ascii=False)
+    _write_csv_rows(run_summary_csv, run_summary["table_rows"])
+    log.info("Run summary saved to %s and %s", run_summary_json, run_summary_csv)
 
 
 if __name__ == "__main__":

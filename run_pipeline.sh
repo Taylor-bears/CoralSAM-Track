@@ -56,6 +56,7 @@ RUN_ID=$(date +"%Y%m%d_%H%M%S")
 # ────────────────────────────────────────────────────────────
 OUTPUT_DIR="outputs/${RUN_ID}"
 EVAL_JSON="${OUTPUT_DIR}/eval_results.json"
+REPORT_DIR="${OUTPUT_DIR}/paper_stats"
 LOG_DIR="logs"
 mkdir -p "${LOG_DIR}" "${OUTPUT_DIR}"
 
@@ -357,7 +358,7 @@ if [ "$RUN_EVAL" = "true" ]; then
     PRED_DIR="${OUTPUT_DIR}/with_drift_corr/masks"
     BASE_DIR="${OUTPUT_DIR}/baseline/masks"
 
-    EVAL_ARGS="--pred_dir ${PRED_DIR} --config ${CONFIG} --output_json ${EVAL_JSON}"
+    EVAL_ARGS="--pred_dir ${PRED_DIR} --config ${CONFIG} --output_json ${EVAL_JSON} --report_dir ${REPORT_DIR}"
     if [ -d "${BASE_DIR}" ]; then
         EVAL_ARGS="$EVAL_ARGS --baseline_dir ${BASE_DIR}"
         log_info "对比模式：with_drift_corr vs baseline"
@@ -375,6 +376,7 @@ if [ "$RUN_EVAL" = "true" ]; then
         if [ $eval_exit -eq 0 ]; then
             log_ok "评测完成  耗时: $(format_duration $eval_dur)"
             log_ok "结果 JSON: ${EVAL_JSON}"
+            log_ok "Paper stats: ${REPORT_DIR}"
         else
             FAILED_STEPS="$FAILED_STEPS eval"
             log_err "评测失败 (exit=$eval_exit)"
@@ -397,6 +399,7 @@ log_info "  基线 masks  : ${OUTPUT_DIR}/baseline/masks/"
 log_info "  纠偏 masks  : ${OUTPUT_DIR}/with_drift_corr/masks/"
 log_info "  可视化      : ${OUTPUT_DIR}/*/vis/"
 log_info "  评测 JSON   : ${EVAL_JSON}"
+log_info "  Paper stats : ${REPORT_DIR}/"
 log_info "日志目录    : ${LOG_DIR}/"
 log_info "  baseline    : ${BASELINE_LOG}"
 log_info "  drift_corr  : ${DRIFT_LOG}"

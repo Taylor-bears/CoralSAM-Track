@@ -65,12 +65,13 @@ class DriftDetector:
         self._consec_required: int = int(drift_cfg.get("consecutive_low_conf", 2))
         self._cooldown_frames: int = int(drift_cfg.get("cooldown_frames", 4))
         self._min_signals: int = int(drift_cfg.get("min_signals", 1))
+        self._history_size: int = int(drift_cfg.get("history_size", 1000000))
 
         # Internal state
         self._ema_conf: Optional[float] = None
         self._low_conf_streak: int = 0
         self._prev_mask: Optional[np.ndarray] = None
-        self._history: Deque[dict] = deque(maxlen=50)
+        self._history: Deque[dict] = deque(maxlen=self._history_size)
         self._cooldown_remaining: int = 0
 
     # ------------------------------------------------------------------
